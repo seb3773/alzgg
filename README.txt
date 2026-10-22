@@ -27,9 +27,9 @@ LEGAL NOTICE & DISCLAIMER (INTEROPERABILITY & DIGITAL PRESERVATION)
 
 OVERVIEW & CAPABILITIES
 --------------------------------------------------------------------------------
-alzgg is a standalone, single-binary C tool providing bidirectional bit-exact
-parity with ESTsoft ALZip (ALZipCon 12.30 and 8.0) for both historical ALZ and
-modern EGG archive formats.
+alzgg is a standalone, single-binary C tool providing bit-exact encoder parity
+with ALZip 12.30 (the writing reference) and 100% decompression compatibility
+with both modern (12.30) and historical (8.0) ALZ and EGG archive formats.
 
 Containers:
   * ALZ (.alz) and EGG (.egg) archive creation, listing and extraction.

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="${VERSION:-1.0.0-1}"
+VERSION="${VERSION:-12.30.0-1}"
 ARCH="amd64"
 DIST_DIR="${SCRIPT_DIR}/dist"
 PKG_DIR="${SCRIPT_DIR}/build/pkg_deb"
@@ -82,8 +82,9 @@ Depends: libc6 (>= 2.15)
 Provides: alzgg
 Description: Bit-exact pure C encoder/decoder for ALZ and EGG archives
  Standalone, freestanding pure C tool combining both compressor and
- decompressor into a single binary (alzgg), achieving 100% bidirectional
- bit-exact parity with ESTsoft ALZip (ALZipCon 12.30 and 8.0).
+ decompressor into a single binary (alzgg), achieving bit-exact encoder
+ parity with ALZip 12.30 and 100% decoder compatibility with both modern
+ (12.30) and historical (8.0) archives.
  Features:
   - Containers: ALZ (.alz) and EGG (.egg) archive creation, listing and extraction
   - Codecs: Store (m0), Deflate (m1/m2), BZip2 (m2), AZO (m3), LZMA (m4)

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-12.30.0}"
 ARCH="linux-x86_64"
 DIST_DIR="${SCRIPT_DIR}/dist"
 TAR_NAME="alzgg-v${VERSION}-${ARCH}.tar.gz"
