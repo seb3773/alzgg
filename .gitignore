@@ -1,0 +1,41 @@
+# Binaires compilés et objets intermédiaires
+/alzgg
+/alz
+*.o
+tests/bin/
+
+# Répertoires de travail, packages et temporaires
+/_work/
+_work/
+/work/
+work/
+/build/
+build/
+/dist/
+dist/
+/out/
+fixtures/out/
+heavy-work*
+*.tmp
+*.log
+/*.deb
+/*.tar.gz
+!corpus/**/*.tar.gz
+
+# Fichiers volumineux (> 100 Mo, tests 5 Go limites hors make test)
+corpus/huge/
+*huge_store_5g*
+*huge_store_45g*
+*huge_enc_zip*
+
+# Binaires et installateurs propriétaires ESTsoft (non redistribuables)
+research/
+vendor/
+
+# Fichiers système et éditeurs
+.DS_Store
+Thumbs.db
+*~
+*.swp
+__pycache__/
+*.pyc

@@ -1,0 +1,109 @@
+# 12.30 references — one entry per writer feature
+#
+# Format: OUTPUT|ALZipCon OPTIONS|INPUTS   (55 lines: 13 ALZ, 42 EGG;
+# `-v` lines produce several files, `.vol1.egg`/`.a00` included)
+#
+# This is the list `tools/manifest_parity.py` replays: `make test` requires
+# byte-for-byte equality on all 55 lines, not on a chosen subset.
+# OUTPUT names the FIRST volume of a `-v` line (`.vol1.egg`).
+#   - OUTPUT is relative to the repository root; the prefix picks the final
+#     directory (`packed_egg/` or `packed_alz/`).
+#   - OPTIONS is passed to ALZipCon as-is (`-a` is added).
+#   - INPUTS: paths under `corpus/`, or the staged trees `two/`, `unicode/`,
+#     `meta/`, `routes/` described below.
+#
+# Staging (after consolidating the sources into `corpus/`):
+#   two/     = corpus/hello.txt + corpus/code.c, two members of one archive
+#   unicode/ = the corpus/unicode tree (갈대숲, café_clair/ nested)
+#   meta/    = the lot D files (attributes, even/odd dates, 2038)
+#   routes/  = the 148 names of the routing matrix, 4 096 bytes each
+# The generator creates only `two/` and `routes/`; the other three are
+# sources, hence versioned under `corpus/`.
+#
+# Proof required for EVERY line: the archive written by `alz create` with the
+# same options is compared byte for byte to the reference, after reinjecting
+# the Header ID (4 random bytes at offset 6) and, for encrypted archives, the
+# randomly drawn material (salt/IV/verifier) — `--crypt-info` exists precisely
+# for that. A cross extraction (ALZip reads back what we write, we read back
+# what ALZip writes) completes the comparison.
+#
+# The 8.0 references do not disappear: they remain the decoding coverage, but
+# they no longer validate the encoder.
+
+# ---------------------------------------------------------------- ALZ (14)
+packed_alz/hello_none.alz|-m0|corpus/hello.txt
+packed_alz/hello_faster.alz|-m1|corpus/hello.txt
+packed_alz/hello_normal.alz|-m2|corpus/hello.txt
+packed_alz/code_normal.alz|-m2|corpus/code.c
+packed_alz/biased_faster.alz|-m1|corpus/biased.bin
+packed_alz/records_faster.alz|-m1|corpus/records.bin
+packed_alz/random_normal.alz|-m2|corpus/random.bin
+packed_alz/zeros_normal.alz|-m2|corpus/zeros.bin
+packed_alz/nested_normal.alz|-m2|corpus/nested
+packed_alz/two_normal.alz|-m2|two
+packed_alz/empty_none.alz|-m0|corpus/empty.dat
+packed_alz/hello_normal_zip.alz|-m2 -tp0 -ppassword|corpus/hello.txt
+packed_alz/records_normal_v100k.alz|-m2 -v100KB|corpus/records.bin
+
+# ---------------------------------------------------------------- EGG (42)
+# five profiles on a single entry: the full 12.30 scale
+packed_egg/hello_none.egg|-m0|corpus/hello.txt
+packed_egg/hello_compspeed.egg|-m1|corpus/hello.txt
+packed_egg/hello_normal.egg|-m2|corpus/hello.txt
+packed_egg/hello_compratio.egg|-m3|corpus/hello.txt
+packed_egg/hello_optimized.egg|-m4|corpus/hello.txt
+# non-trivial profiles on different payloads
+packed_egg/code_compspeed.egg|-m1|corpus/code.c
+packed_egg/code_normal.egg|-m2|corpus/code.c
+packed_egg/code_compratio.egg|-m3|corpus/code.c
+packed_egg/code_optimized.egg|-m4|corpus/code.c
+packed_egg/biased_compspeed.egg|-m1|corpus/biased.bin
+packed_egg/biased_normal.egg|-m2|corpus/biased.bin
+packed_egg/records_compspeed.egg|-m1|corpus/records.bin
+packed_egg/records_normal.egg|-m2|corpus/records.bin
+packed_egg/records_compratio.egg|-m3|corpus/records.bin
+packed_egg/random_compspeed.egg|-m1|corpus/random.bin
+packed_egg/random_normal.egg|-m2|corpus/random.bin
+packed_egg/zeros_normal.egg|-m2|corpus/zeros.bin
+packed_egg/nested_normal.egg|-m2|corpus/nested
+packed_egg/empty_none.egg|-m0|corpus/empty.dat
+# multi-member: one header, two members, every profile
+packed_egg/two_m0.egg|-m0|two
+packed_egg/two_m1.egg|-m1|two
+packed_egg/two_m2.egg|-m2|two
+packed_egg/two_m3.egg|-m3|two
+packed_egg/two_m4.egg|-m4|two
+# solid: the only two profiles ALZip accepts
+packed_egg/nested_compspeed_solid.egg|-s -m1|corpus/nested
+packed_egg/nested_compratio_solid.egg|-s -m3|corpus/nested
+# Optimized routing outside the measured lists / routes
+packed_egg/probe_sys_optimized.egg|-m4|corpus/probe.sys
+packed_egg/probe_com_optimized.egg|-m4|corpus/probe.com
+packed_egg/probe_doc_optimized.egg|-m4|corpus/probe.doc
+packed_egg/probe_ico_optimized.egg|-m4|corpus/probe.ico
+packed_egg/routes_optimized.egg|-m4|routes
+# encryption: one reference per method
+packed_egg/hello_compspeed_zip.egg|-m1 -tp0 -ppassword|corpus/hello.txt
+packed_egg/hello_normal_aes128.egg|-m2 -tp1 -ppassword|corpus/hello.txt
+packed_egg/hello_normal_aes256.egg|-m2 -tp2 -ppassword|corpus/hello.txt
+packed_egg/hello_normal_lea128.egg|-m2 -tp3 -ppassword|corpus/hello.txt
+packed_egg/hello_normal_lea256.egg|-m2 -tp4 -ppassword|corpus/hello.txt
+# two members under one password (one material per member)
+packed_egg/two_m1_zip.egg|-m1 -tp0 -ppassword|two
+# volumes: plain, then encrypted (ALZip encrypts before splitting)
+packed_egg/records_compspeed_v100k.vol1.egg|-m1 -v100KB|corpus/records.bin
+packed_egg/records_compspeed_v100k_zip.vol1.egg|-m1 -tp0 -ppassword -v100KB|corpus/records.bin
+# non-ASCII names, plus attributes/directories
+packed_egg/unicode_normal.egg|-m2|unicode
+packed_egg/unicode_compspeed_solid.egg|-s -m1|unicode
+packed_egg/meta_compspeed.egg|-m1|meta
+
+# ------------------------------------------------------------ not generated (8.0)
+# Kept as they are for decoding only: lot H (5 GiB, 16 encrypted volumes,
+# refusals), lot E (224 routing probes replaced by `routes_optimized.egg`),
+# GUI matrices, the complete 8.0 corpus.
+#
+# Heavy cases deliberately left out of this list (cost > 20 GiB and several
+# minutes of Wine): 5 GiB ALZ/EGG store, ~1 GiB multi-block solid. They remain
+# covered by lot H and `make heavy`; regenerate them in 12.30 only if
+# multi-block splitting beyond 3 GiB must be proven on the writer side.

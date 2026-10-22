@@ -1,0 +1,2 @@
+Hello ALzip world!
+This is a test of the ALZ compression format.
