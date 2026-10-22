@@ -23,9 +23,7 @@ the same shape as ALZip's own console front end.
 
 - [Format specification: ALZ](FORMAT-ALZ.md)
 - [Format specification: EGG](FORMAT-EGG.md)
-- [Parity scoreboard](_work/STATUS.md) — per-capability status (dev notes)
 - [Fixtures and how they were produced](FIXTURES.md)
-- [Roadmap and open questions](_work/PLANS.md)
 
 ## Features
 
