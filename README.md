@@ -1,4 +1,4 @@
-# alzgg (alzip-port)
+# alzgg (alzip alz & egg port)
 
 > [!IMPORTANT]
 > **Legal Notice & Disclaimer (Interoperability & Digital Preservation)**
