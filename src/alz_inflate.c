@@ -59,7 +59,7 @@ static void binit(BitR *b, const uint8_t *buf, size_t size)
 /* --------- canonical Huffman decoder (RFC1951 style) ---------- */
 #define MAX_BITS 15
 typedef struct Huff {
-    int16_t count[MAX_BITS + 1];   /* nb de codes par longueur */
+    int16_t count[MAX_BITS + 1];   /* number of codes per bit-length */
     int16_t symbol[288 + 30 + 2];  /* symbols sorted by (canonical code) */
     int fast[MAX_BITS + 1];        /* first code value per length */
 } Huff;

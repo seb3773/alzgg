@@ -195,11 +195,47 @@ static size_t lz_write(void *p, const void *buf, size_t size)
     return put;
 }
 
+/* One encoder for the whole process, reused from member to member: its
+ * properties never change (level 5), LzmaEnc_Encode re-initialises every
+ * model, price table and range coder state (LzmaEnc_AllocAndInit), and the
+ * match finder keeps its 160 MiB of tables instead of reallocating and
+ * clearing them per member (see MatchFinder_Init in lzma_sdk/LzFind.c). A
+ * failed encode drops the encoder: the next member starts from scratch. */
+static CLzmaEncHandle g_enc;
+static Byte  g_props[LZMA_PROPS_SIZE];
+static SizeT g_props_size;
+
+static void lzma_encoder_drop(void)
+{
+    if (g_enc) LzmaEnc_Destroy(g_enc, &lz_allocator, &lz_allocator);
+    g_enc = NULL;
+}
+
+static CLzmaEncHandle lzma_encoder(Byte *props_enc, SizeT *props_size)
+{
+    if (!g_enc) {
+        CLzmaEncProps props;
+        LzmaEncProps_Init(&props);
+        props.level = 5;            /* setting measured on the 25 reference blocks */
+        g_enc = LzmaEnc_Create(&lz_allocator);
+        if (!g_enc) return NULL;
+        g_props_size = LZMA_PROPS_SIZE;
+        if (LzmaEnc_SetProps(g_enc, &props) != SZ_OK ||
+            LzmaEnc_WriteProperties(g_enc, g_props, &g_props_size) != SZ_OK) {
+            lzma_encoder_drop();
+            return NULL;
+        }
+        atexit(lzma_encoder_drop);
+    }
+    memcpy(props_enc, g_props, g_props_size);
+    *props_size = g_props_size;
+    return g_enc;
+}
+
 int egg_lzma_encode_stream(FILE *in_file, uint64_t len, FILE **blob,
                            uint64_t *csize, uint32_t *crc,
                            char *err, size_t errsz)
 {
-    CLzmaEncProps props;
     CLzmaEncHandle enc = NULL;
     Byte props_enc[LZMA_PROPS_SIZE];
     SizeT props_size = LZMA_PROPS_SIZE;
@@ -215,16 +251,9 @@ int egg_lzma_encode_stream(FILE *in_file, uint64_t len, FILE **blob,
         return -1;
     }
 
-    LzmaEncProps_Init(&props);
-    props.level = 5;            /* setting measured on the 25 reference blocks */
-    enc = LzmaEnc_Create(&lz_allocator);
+    enc = lzma_encoder(props_enc, &props_size);
     if (!enc) {
         err_set(err, errsz, "LZMA: out of memory");
-        goto done;
-    }
-    if (LzmaEnc_SetProps(enc, &props) != SZ_OK ||
-        LzmaEnc_WriteProperties(enc, props_enc, &props_size) != SZ_OK) {
-        err_set(err, errsz, "LZMA: encoder rejected the properties");
         goto done;
     }
 
@@ -269,7 +298,7 @@ int egg_lzma_encode_stream(FILE *in_file, uint64_t len, FILE **blob,
     rc = 0;
 
 done:
-    if (enc) LzmaEnc_Destroy(enc, &lz_allocator, &lz_allocator);
+    if (rc && enc) lzma_encoder_drop();
     if (tmp) fclose(tmp);
     return rc;
 }

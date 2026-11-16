@@ -198,7 +198,7 @@ static uint32_t sub_word(uint32_t w)
            (uint32_t)aes_sbox[w & 0xFF];
 }
 
-/* nk : 4 (AES-128) ou 8 (AES-256) */
+/* nk: 4 (AES-128) or 8 (AES-256) */
 static void aes_expand(Aes *a, const uint8_t *key, int nk)
 {
     int nwords, i;
@@ -282,6 +282,134 @@ static void aes_encrypt_block(const Aes *a, const uint8_t in[16], uint8_t out[16
     memcpy(out, s, 16);
 }
 
+/* alzgg: AE-2 CTR keystream over `len` bytes: E(ctr), E(ctr+1), ... with the
+ * 128-bit little-endian counter (+1 per 16-byte block, a final partial block
+ * still consuming its counter), XORed into buf; `ctr` is left advanced. AES-NI
+ * when the CPU has it (checked once at run time against aes_encrypt_block),
+ * the portable code otherwise: the same bytes either way. */
+static void aes_ctr_inc(uint8_t ctr[16])
+{
+    int i;
+
+    for (i = 0; i < 16; ++i) if (++ctr[i]) break;
+}
+
+static void aes_ctr_xor_ref(const Aes *a, uint8_t ctr[16], uint8_t *buf, size_t len)
+{
+    uint8_t ks[16];
+    size_t i;
+
+    while (len) {
+        size_t n = len < 16 ? len : 16;
+
+        aes_encrypt_block(a, ctr, ks);
+        for (i = 0; i < n; ++i) buf[i] ^= ks[i];
+        aes_ctr_inc(ctr);
+        buf += n;
+        len -= n;
+    }
+    memset(ks, 0, sizeof ks);
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)) && \
+    !defined(ALZGG_NO_AESNI)
+#include <immintrin.h>
+#define ALZGG_HAVE_AESNI 1
+__attribute__((target("aes,sse2")))
+static void aes_ctr_xor_ni(const Aes *a, uint8_t ctr[16], uint8_t *buf, size_t len)
+{
+    __m128i rk[15];
+    uint8_t kb[16], ks[64];
+    int r, j;
+
+    for (r = 0; r <= a->nr; ++r) {
+        for (j = 0; j < 4; ++j) {
+            uint32_t w = a->rk[4 * r + j];
+            kb[4 * j + 0] = (uint8_t)(w >> 24);
+            kb[4 * j + 1] = (uint8_t)(w >> 16);
+            kb[4 * j + 2] = (uint8_t)(w >> 8);
+            kb[4 * j + 3] = (uint8_t)w;
+        }
+        rk[r] = _mm_loadu_si128((const __m128i *)kb);
+    }
+    while (len >= 64) {
+        __m128i b0, b1, b2, b3;
+
+        b0 = _mm_loadu_si128((const __m128i *)ctr); aes_ctr_inc(ctr);
+        b1 = _mm_loadu_si128((const __m128i *)ctr); aes_ctr_inc(ctr);
+        b2 = _mm_loadu_si128((const __m128i *)ctr); aes_ctr_inc(ctr);
+        b3 = _mm_loadu_si128((const __m128i *)ctr); aes_ctr_inc(ctr);
+        b0 = _mm_xor_si128(b0, rk[0]); b1 = _mm_xor_si128(b1, rk[0]);
+        b2 = _mm_xor_si128(b2, rk[0]); b3 = _mm_xor_si128(b3, rk[0]);
+        for (r = 1; r < a->nr; ++r) {
+            b0 = _mm_aesenc_si128(b0, rk[r]); b1 = _mm_aesenc_si128(b1, rk[r]);
+            b2 = _mm_aesenc_si128(b2, rk[r]); b3 = _mm_aesenc_si128(b3, rk[r]);
+        }
+        b0 = _mm_aesenclast_si128(b0, rk[a->nr]); b1 = _mm_aesenclast_si128(b1, rk[a->nr]);
+        b2 = _mm_aesenclast_si128(b2, rk[a->nr]); b3 = _mm_aesenclast_si128(b3, rk[a->nr]);
+        _mm_storeu_si128((__m128i *)buf,
+                         _mm_xor_si128(_mm_loadu_si128((const __m128i *)buf), b0));
+        _mm_storeu_si128((__m128i *)(buf + 16),
+                         _mm_xor_si128(_mm_loadu_si128((const __m128i *)(buf + 16)), b1));
+        _mm_storeu_si128((__m128i *)(buf + 32),
+                         _mm_xor_si128(_mm_loadu_si128((const __m128i *)(buf + 32)), b2));
+        _mm_storeu_si128((__m128i *)(buf + 48),
+                         _mm_xor_si128(_mm_loadu_si128((const __m128i *)(buf + 48)), b3));
+        buf += 64;
+        len -= 64;
+    }
+    while (len) {
+        size_t n = len < 16 ? len : 16, i;
+        __m128i b = _mm_xor_si128(_mm_loadu_si128((const __m128i *)ctr), rk[0]);
+
+        for (r = 1; r < a->nr; ++r) b = _mm_aesenc_si128(b, rk[r]);
+        b = _mm_aesenclast_si128(b, rk[a->nr]);
+        _mm_storeu_si128((__m128i *)ks, b);
+        for (i = 0; i < n; ++i) buf[i] ^= ks[i];
+        aes_ctr_inc(ctr);
+        buf += n;
+        len -= n;
+    }
+    memset(kb, 0, sizeof kb);
+    memset(ks, 0, sizeof ks);
+    memset(rk, 0, sizeof rk);
+}
+#endif
+
+typedef void (*aes_ctr_fn)(const Aes *, uint8_t *, uint8_t *, size_t);
+static aes_ctr_fn aes_ctr_impl;
+
+static void aes_ctr_select(void)
+{
+    aes_ctr_fn pick = aes_ctr_xor_ref;
+#ifdef ALZGG_HAVE_AESNI
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("aes")) {
+        /* self-check on a fixed key / counter / 100-byte buffer */
+        Aes t;
+        uint8_t key[32], c1[16], c2[16], b1[100], b2[100];
+        int i;
+
+        for (i = 0; i < 32; ++i) key[i] = (uint8_t)(i * 7 + 1);
+        for (i = 0; i < 100; ++i) b1[i] = b2[i] = (uint8_t)(i * 13);
+        for (i = 0; i < 16; ++i) c1[i] = c2[i] = (uint8_t)(i == 0 ? 0xFE : 0xFF);
+        aes_expand(&t, key, 8);
+        aes_ctr_xor_ref(&t, c1, b1, sizeof b1);
+        aes_ctr_xor_ni(&t, c2, b2, sizeof b2);
+        if (!memcmp(b1, b2, sizeof b1) && !memcmp(c1, c2, sizeof c1))
+            pick = aes_ctr_xor_ni;
+        memset(&t, 0, sizeof t);
+    }
+#endif
+    aes_ctr_impl = pick;
+}
+
+static void aes_ctr_xor(const Aes *a, uint8_t ctr[16], uint8_t *buf, size_t len)
+{
+    if (!aes_ctr_impl) aes_ctr_select();
+    aes_ctr_impl(a, ctr, buf, len);
+}
+
 /* ================================================================== SHA-1 === */
 typedef struct Sha1 {
     uint32_t h[5];
@@ -295,26 +423,225 @@ static uint32_t rol32(uint32_t x, int n)
     return (x << n) | (x >> (32 - n));
 }
 
+/* alzgg: SHA-1 compression of `nblk` consecutive 64-byte blocks into h[5].
+ * Three implementations of the same function (FIPS 180-4), picked once at
+ * run time: the SHA-NI instructions when the CPU has them, otherwise an
+ * unrolled scalar version; the original loop is kept as the reference
+ * (ALZGG_SHA1_REF) and the self-test below compares them at first use. */
+static void sha1_blocks_ref(uint32_t h[5], const uint8_t *p, size_t nblk)
+{
+    for (; nblk; --nblk, p += 64) {
+        uint32_t w[80], a, b, c, d, e;
+        int i;
+
+        for (i = 0; i < 16; ++i) w[i] = be32(p + 4 * i);
+        for (i = 16; i < 80; ++i)
+            w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+        a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4];
+        for (i = 0; i < 80; ++i) {
+            uint32_t f, k, t;
+            if (i < 20)      { f = (b & c) | (~b & d);          k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d;                   k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+            else             { f = b ^ c ^ d;                   k = 0xCA62C1D6u; }
+            t = rol32(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+}
+
+#define SHA1_ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define SHA1_W(i) (w[(i) & 15] = SHA1_ROL(w[((i) + 13) & 15] ^ w[((i) + 8) & 15] ^ \
+                                          w[((i) + 2) & 15] ^ w[(i) & 15], 1))
+#define SHA1_R(a, b, c, d, e, f, k, wi) \
+    { e += SHA1_ROL(a, 5) + (f) + (k) + (wi); b = SHA1_ROL(b, 30); }
+#define SHA1_F1(b, c, d) ((d) ^ ((b) & ((c) ^ (d))))
+#define SHA1_F2(b, c, d) ((b) ^ (c) ^ (d))
+#define SHA1_F3(b, c, d) (((b) & (c)) | ((d) & ((b) | (c))))
+
+static void sha1_blocks_scalar(uint32_t h[5], const uint8_t *p, size_t nblk)
+{
+    for (; nblk; --nblk, p += 64) {
+        uint32_t w[16], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        int i;
+
+        for (i = 0; i < 16; ++i) w[i] = be32(p + 4 * i);
+        for (i = 0; i < 15; i += 5) {
+            SHA1_R(a, b, c, d, e, SHA1_F1(b, c, d), 0x5A827999u, w[i]);
+            SHA1_R(e, a, b, c, d, SHA1_F1(a, b, c), 0x5A827999u, w[i + 1]);
+            SHA1_R(d, e, a, b, c, SHA1_F1(e, a, b), 0x5A827999u, w[i + 2]);
+            SHA1_R(c, d, e, a, b, SHA1_F1(d, e, a), 0x5A827999u, w[i + 3]);
+            SHA1_R(b, c, d, e, a, SHA1_F1(c, d, e), 0x5A827999u, w[i + 4]);
+        }
+        SHA1_R(a, b, c, d, e, SHA1_F1(b, c, d), 0x5A827999u, w[15]);
+        SHA1_R(e, a, b, c, d, SHA1_F1(a, b, c), 0x5A827999u, SHA1_W(16));
+        SHA1_R(d, e, a, b, c, SHA1_F1(e, a, b), 0x5A827999u, SHA1_W(17));
+        SHA1_R(c, d, e, a, b, SHA1_F1(d, e, a), 0x5A827999u, SHA1_W(18));
+        SHA1_R(b, c, d, e, a, SHA1_F1(c, d, e), 0x5A827999u, SHA1_W(19));
+        for (i = 20; i < 40; i += 5) {
+            SHA1_R(a, b, c, d, e, SHA1_F2(b, c, d), 0x6ED9EBA1u, SHA1_W(i));
+            SHA1_R(e, a, b, c, d, SHA1_F2(a, b, c), 0x6ED9EBA1u, SHA1_W(i + 1));
+            SHA1_R(d, e, a, b, c, SHA1_F2(e, a, b), 0x6ED9EBA1u, SHA1_W(i + 2));
+            SHA1_R(c, d, e, a, b, SHA1_F2(d, e, a), 0x6ED9EBA1u, SHA1_W(i + 3));
+            SHA1_R(b, c, d, e, a, SHA1_F2(c, d, e), 0x6ED9EBA1u, SHA1_W(i + 4));
+        }
+        for (i = 40; i < 60; i += 5) {
+            SHA1_R(a, b, c, d, e, SHA1_F3(b, c, d), 0x8F1BBCDCu, SHA1_W(i));
+            SHA1_R(e, a, b, c, d, SHA1_F3(a, b, c), 0x8F1BBCDCu, SHA1_W(i + 1));
+            SHA1_R(d, e, a, b, c, SHA1_F3(e, a, b), 0x8F1BBCDCu, SHA1_W(i + 2));
+            SHA1_R(c, d, e, a, b, SHA1_F3(d, e, a), 0x8F1BBCDCu, SHA1_W(i + 3));
+            SHA1_R(b, c, d, e, a, SHA1_F3(c, d, e), 0x8F1BBCDCu, SHA1_W(i + 4));
+        }
+        for (i = 60; i < 80; i += 5) {
+            SHA1_R(a, b, c, d, e, SHA1_F2(b, c, d), 0xCA62C1D6u, SHA1_W(i));
+            SHA1_R(e, a, b, c, d, SHA1_F2(a, b, c), 0xCA62C1D6u, SHA1_W(i + 1));
+            SHA1_R(d, e, a, b, c, SHA1_F2(e, a, b), 0xCA62C1D6u, SHA1_W(i + 2));
+            SHA1_R(c, d, e, a, b, SHA1_F2(d, e, a), 0xCA62C1D6u, SHA1_W(i + 3));
+            SHA1_R(b, c, d, e, a, SHA1_F2(c, d, e), 0xCA62C1D6u, SHA1_W(i + 4));
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)) && \
+    !defined(ALZGG_NO_SHANI)
+#include <immintrin.h>
+#define ALZGG_HAVE_SHANI 1
+/* SHA-NI, the standard Intel sequence (sha1rnds4 / sha1nexte / sha1msg1/2). */
+__attribute__((target("sha,sse4.1")))
+static void sha1_blocks_shani(uint32_t h[5], const uint8_t *p, size_t nblk)
+{
+    const __m128i mask = _mm_set_epi64x(0x0001020304050607ULL, 0x08090a0b0c0d0e0fULL);
+    __m128i abcd = _mm_loadu_si128((const __m128i *)h);
+    __m128i e0 = _mm_set_epi32((int)h[4], 0, 0, 0);
+    __m128i e1, abcd_save, e_save, m0, m1, m2, m3;
+
+    abcd = _mm_shuffle_epi32(abcd, 0x1B);
+    for (; nblk; --nblk, p += 64) {
+        abcd_save = abcd;
+        e_save = e0;
+
+        m0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 0)), mask);
+        e0 = _mm_add_epi32(e0, m0);
+        e1 = abcd;
+        abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+
+        m1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 16)), mask);
+        e1 = _mm_sha1nexte_epu32(e1, m1);
+        e0 = abcd;
+        abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+        m0 = _mm_sha1msg1_epu32(m0, m1);
+
+        m2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 32)), mask);
+        e0 = _mm_sha1nexte_epu32(e0, m2);
+        e1 = abcd;
+        abcd = _mm_sha1rnds4_epu32(abcd, e0, 0);
+        m1 = _mm_sha1msg1_epu32(m1, m2);
+        m0 = _mm_xor_si128(m0, m2);
+
+        m3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 48)), mask);
+        e1 = _mm_sha1nexte_epu32(e1, m3);
+        e0 = abcd;
+        m0 = _mm_sha1msg2_epu32(m0, m3);
+        abcd = _mm_sha1rnds4_epu32(abcd, e1, 0);
+        m2 = _mm_sha1msg1_epu32(m2, m3);
+        m1 = _mm_xor_si128(m1, m3);
+
+#define SHANI_4(EA, EB, MA, MB, MC, MD, F) \
+        EA = _mm_sha1nexte_epu32(EA, MA); \
+        EB = abcd; \
+        MB = _mm_sha1msg2_epu32(MB, MA); \
+        abcd = _mm_sha1rnds4_epu32(abcd, EA, F); \
+        MD = _mm_sha1msg1_epu32(MD, MA); \
+        MC = _mm_xor_si128(MC, MA);
+
+        SHANI_4(e0, e1, m0, m1, m2, m3, 0)   /* 16-19 */
+        SHANI_4(e1, e0, m1, m2, m3, m0, 1)   /* 20-23 */
+        SHANI_4(e0, e1, m2, m3, m0, m1, 1)
+        SHANI_4(e1, e0, m3, m0, m1, m2, 1)
+        SHANI_4(e0, e1, m0, m1, m2, m3, 1)
+        SHANI_4(e1, e0, m1, m2, m3, m0, 1)   /* 36-39 */
+        SHANI_4(e0, e1, m2, m3, m0, m1, 2)   /* 40-43 */
+        SHANI_4(e1, e0, m3, m0, m1, m2, 2)
+        SHANI_4(e0, e1, m0, m1, m2, m3, 2)
+        SHANI_4(e1, e0, m1, m2, m3, m0, 2)
+        SHANI_4(e0, e1, m2, m3, m0, m1, 2)   /* 56-59 */
+        SHANI_4(e1, e0, m3, m0, m1, m2, 3)   /* 60-63 */
+        SHANI_4(e0, e1, m0, m1, m2, m3, 3)
+#undef SHANI_4
+        /* 68-71 */
+        e1 = _mm_sha1nexte_epu32(e1, m1);
+        e0 = abcd;
+        m2 = _mm_sha1msg2_epu32(m2, m1);
+        abcd = _mm_sha1rnds4_epu32(abcd, e1, 3);
+        m3 = _mm_xor_si128(m3, m1);
+        /* 72-75 */
+        e0 = _mm_sha1nexte_epu32(e0, m2);
+        e1 = abcd;
+        m3 = _mm_sha1msg2_epu32(m3, m2);
+        abcd = _mm_sha1rnds4_epu32(abcd, e0, 3);
+        /* 76-79 */
+        e1 = _mm_sha1nexte_epu32(e1, m3);
+        e0 = abcd;
+        abcd = _mm_sha1rnds4_epu32(abcd, e1, 3);
+
+        e0 = _mm_sha1nexte_epu32(e0, e_save);
+        abcd = _mm_add_epi32(abcd, abcd_save);
+    }
+    abcd = _mm_shuffle_epi32(abcd, 0x1B);
+    _mm_storeu_si128((__m128i *)h, abcd);
+    h[4] = (uint32_t)_mm_extract_epi32(e0, 3);
+}
+#endif
+
+typedef void (*sha1_blocks_fn)(uint32_t h[5], const uint8_t *p, size_t nblk);
+static sha1_blocks_fn sha1_blocks_impl;
+
+/* First use: choose, then check the choice against the reference on a
+ * fixed pseudo-random input; any disagreement falls back to the reference. */
+static void sha1_select(void)
+{
+    sha1_blocks_fn pick = sha1_blocks_scalar;
+    uint8_t buf[192];
+    uint32_t a[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    uint32_t b[5], c[5];
+    unsigned i, x = 0x12345678u;
+
+#ifdef ALZGG_HAVE_SHANI
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("sha") && __builtin_cpu_supports("sse4.1"))
+        pick = sha1_blocks_shani;
+#endif
+#ifdef ALZGG_SHA1_REF
+    pick = sha1_blocks_ref;
+#endif
+    for (i = 0; i < sizeof buf; ++i) {
+        x = x * 1103515245u + 12345u;
+        buf[i] = (uint8_t)(x >> 24);
+    }
+    memcpy(b, a, sizeof a);
+    memcpy(c, a, sizeof a);
+    sha1_blocks_ref(b, buf, 3);
+    pick(c, buf, 3);
+    if (memcmp(b, c, sizeof b)) {
+        memcpy(c, a, sizeof a);
+        sha1_blocks_scalar(c, buf, 3);
+        pick = memcmp(b, c, sizeof b) ? sha1_blocks_ref : sha1_blocks_scalar;
+    }
+    sha1_blocks_impl = pick;
+}
+
+static void sha1_blocks(uint32_t h[5], const uint8_t *p, size_t nblk)
+{
+    if (!sha1_blocks_impl) sha1_select();
+    sha1_blocks_impl(h, p, nblk);
+}
+
 static void sha1_block(Sha1 *s, const uint8_t *p)
 {
-    uint32_t w[80], a, b, c, d, e;
-    int i;
-
-    for (i = 0; i < 16; ++i) w[i] = be32(p + 4 * i);
-    for (i = 16; i < 80; ++i)
-        w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-
-    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3]; e = s->h[4];
-    for (i = 0; i < 80; ++i) {
-        uint32_t f, k, t;
-        if (i < 20)      { f = (b & c) | (~b & d);          k = 0x5A827999u; }
-        else if (i < 40) { f = b ^ c ^ d;                   k = 0x6ED9EBA1u; }
-        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
-        else             { f = b ^ c ^ d;                   k = 0xCA62C1D6u; }
-        t = rol32(a, 5) + f + e + k + w[i];
-        e = d; d = c; c = rol32(b, 30); b = a; a = t;
-    }
-    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e;
+    sha1_blocks(s->h, p, 1);
 }
 
 static void sha1_init(Sha1 *s)
@@ -336,7 +663,11 @@ static void sha1_update(Sha1 *s, const uint8_t *p, size_t n)
         n -= take;
         if (s->n == 64) { sha1_block(s, s->buf); s->n = 0; }
     }
-    while (n >= 64) { sha1_block(s, p); p += 64; n -= 64; }
+    if (n >= 64) {
+        sha1_blocks(s->h, p, n / 64);
+        p += n & ~(size_t)63;
+        n &= 63;
+    }
     if (n) { memcpy(s->buf, p, n); s->n = n; }
 }
 
@@ -347,10 +678,20 @@ static void sha1_final(Sha1 *s, uint8_t out[20])
     int i;
     uint8_t one = 0x80, zero = 0x00;
 
-    sha1_update(s, &one, 1);
-    while (s->n != 56) sha1_update(s, &zero, 1);
+    /* alzgg: the same padding (0x80, zeros up to 56 mod 64, the 64-bit
+     * big-endian length), written in place instead of byte by byte. */
+    (void)zero;
+    s->buf[s->n++] = one;
+    if (s->n > 56) {
+        memset(s->buf + s->n, 0, 64 - s->n);
+        sha1_block(s, s->buf);
+        s->n = 0;
+    }
+    memset(s->buf + s->n, 0, 56 - s->n);
     for (i = 0; i < 8; ++i) pad[i] = (uint8_t)(bits >> (8 * (7 - i)));
-    sha1_update(s, pad, 8);
+    memcpy(s->buf + 56, pad, 8);
+    sha1_block(s, s->buf);
+    s->n = 0;
     for (i = 0; i < 5; ++i) {
         out[4 * i + 0] = (uint8_t)(s->h[i] >> 24);
         out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
@@ -441,12 +782,47 @@ static void pbkdf2_hmac_sha1(const uint8_t *pw, size_t pwlen,
         saltblk[saltlen + 2] = (uint8_t)(block >> 8);
         saltblk[saltlen + 3] = (uint8_t)block;
 
-        /* U1 = HMAC(pw, salt || block), puis Ui = HMAC(pw, U(i-1)) */
+        /* U1 = HMAC(pw, salt || block), then Ui = HMAC(pw, U(i-1)) */
         hmac_sha1_pads(ipad, opad, saltblk, saltlen + 4, u);
         memcpy(t, u, 20);
-        for (i = 1; i < iters; ++i) {
-            hmac_sha1_pads(ipad, opad, u, 20, u);
-            for (j = 0; j < 20; ++j) t[j] ^= u[j];
+        /* alzgg: Ui = HMAC(pw, U(i-1)) with the ipad / opad compressions
+         * done once (midstates) and the single padded block of a 20-byte
+         * message built directly: 2 compressions per iteration instead of 4,
+         * same values. */
+        {
+            uint32_t hi[5], ho[5], hs[5];
+            uint8_t blk[64];
+            Sha1 st;
+
+            sha1_init(&st); sha1_block(&st, ipad); memcpy(hi, st.h, sizeof hi);
+            sha1_init(&st); sha1_block(&st, opad); memcpy(ho, st.h, sizeof ho);
+            memset(blk, 0, sizeof blk);
+            blk[20] = 0x80;
+            blk[62] = (uint8_t)(((64 + 20) * 8) >> 8);   /* 672 bits */
+            blk[63] = (uint8_t)((64 + 20) * 8);
+            for (i = 1; i < iters; ++i) {
+                memcpy(blk, u, 20);
+                memcpy(hs, hi, sizeof hs);
+                sha1_blocks(hs, blk, 1);
+                for (j = 0; j < 5; ++j) {
+                    blk[4 * j + 0] = (uint8_t)(hs[j] >> 24);
+                    blk[4 * j + 1] = (uint8_t)(hs[j] >> 16);
+                    blk[4 * j + 2] = (uint8_t)(hs[j] >> 8);
+                    blk[4 * j + 3] = (uint8_t)hs[j];
+                }
+                memcpy(hs, ho, sizeof hs);
+                sha1_blocks(hs, blk, 1);
+                for (j = 0; j < 5; ++j) {
+                    u[4 * j + 0] = (uint8_t)(hs[j] >> 24);
+                    u[4 * j + 1] = (uint8_t)(hs[j] >> 16);
+                    u[4 * j + 2] = (uint8_t)(hs[j] >> 8);
+                    u[4 * j + 3] = (uint8_t)hs[j];
+                }
+                for (j = 0; j < 20; ++j) t[j] ^= u[j];
+            }
+            memset(hi, 0, sizeof hi); memset(ho, 0, sizeof ho);
+            memset(hs, 0, sizeof hs); memset(blk, 0, sizeof blk);
+            memset(&st, 0, sizeof st);
         }
 
         take = outlen - done < 20 ? outlen - done : 20;
@@ -574,11 +950,11 @@ the member data). */
 
         if (crypt_is_lea(method)) {
             egg_lea_init(&lea, dk, (size_t)klen);
-            memset(ctr, 0, sizeof ctr);   /* LEA : compteur 128 bits gros-boutiste */
+            memset(ctr, 0, sizeof ctr);   /* LEA: 128-bit big-endian counter */
         } else {
             aes_expand(&aes, dk, klen / 4);
             memset(ctr, 0, sizeof ctr);
-            ctr[0] = 1;                   /* AE-2 : valeur 1, petit-boutiste */
+            ctr[0] = 1;                   /* AE-2: value 1, little-endian */
         }
         for (off = 0; off < len; off += 16) {
             n = len - off < 16 ? len - off : 16;
@@ -716,7 +1092,7 @@ EggCryptCtx *egg_crypt_enc_begin(int method, const EggCryptMaterial *material,
             /* LEA: big-endian 128-bit counter, zeroed (spec §12.5.6). */
         } else {
             aes_expand(&ctx->aes, dk, klen / 4);
-            ctx->ctr[0] = 1;                            /* AE-2, petit-boutiste */
+            ctx->ctr[0] = 1;                            /* AE-2, little-endian */
         }
         /* HMAC of the CIPHERTEXT, key = dk[klen..2*klen): incremental state so
          * the whole stream need not be kept in memory. */
@@ -750,25 +1126,16 @@ int egg_crypt_enc_update(EggCryptCtx *ctx, uint8_t *buf, size_t len)
         return 0;
     }
     if (crypt_keylen(ctx->method)) {
-        uint8_t ks[16];
-        int lea = crypt_is_lea(ctx->method);
-
-        for (off = 0; off < len; off += 16) {
-            size_t n = len - off < 16 ? len - off : 16;
-
-            if (lea) {
-                egg_lea_encrypt(&ctx->lea, ctx->ctr, ks);
-                for (i = 0; i < n; ++i) buf[off + i] ^= ks[i];
-                sha1_update(&ctx->mac, buf + off, n);   /* the CIPHERTEXT */
-                ctr_inc_be(ctx->ctr);
-            } else {
-                aes_encrypt_block(&ctx->aes, ctx->ctr, ks);
-                for (i = 0; i < n; ++i) buf[off + i] ^= ks[i];
-                sha1_update(&ctx->mac, buf + off, n);   /* the CIPHERTEXT */
-                for (i = 0; i < 16; ++i) if (++ctx->ctr[i]) break;
-            }
-        }
-        memset(ks, 0, sizeof ks);
+        /* alzgg: the whole buffer is encrypted (same 16-byte block partition
+         * as before: a counter per block from buf[0], the partial tail
+         * consuming one), then its CIPHERTEXT is hashed in one call -- the
+         * HMAC is over the same byte sequence. */
+        (void)i; (void)off;
+        if (crypt_is_lea(ctx->method))
+            egg_lea_ctr_xor(&ctx->lea, ctx->ctr, buf, len);
+        else
+            aes_ctr_xor(&ctx->aes, ctx->ctr, buf, len);
+        sha1_update(&ctx->mac, buf, len);
         return 0;
     }
     return -1;
@@ -926,7 +1293,7 @@ int egg_crypt_dec_ready(EggCryptDec *d, char *err, size_t errsz)
         /* LEA: big-endian 128-bit counter, zeroed (spec §12.5.6). */
     } else {
         aes_expand(&d->aes, d->dk, d->klen / 4);
-        d->ctr[0] = 1;              /* compteur AE-2, petit-boutiste */
+        d->ctr[0] = 1;              /* AE-2 counter, little-endian */
     }
     d->authed = 1;
     return 0;

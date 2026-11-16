@@ -37,6 +37,21 @@
 
 #include "zlib.h"   /* crc32 (zlib vendored in src/zlib_deflate) */
 
+/* alzgg: optional fast paths; each computes exactly the reference value. */
+#if defined(__GNUC__) && defined(__BYTE_ORDER__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && \
+    (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+#define AZO_WORDS 1
+#else
+#define AZO_WORDS 0
+#endif
+#if defined(__GNUC__) && defined(__SSE2__)
+#include <emmintrin.h>
+#define AZO_SSE2 1
+#else
+#define AZO_SSE2 0
+#endif
+
 /* ============================================================ bit reader ==== */
 
 typedef struct {
@@ -432,6 +447,55 @@ static void buf_bit(AzoBuf *b, unsigned bit)
     }
 }
 
+#if AZO_WORDS
+/* alzgg: emits the `n` low bits of `v` (1 <= n <= 32), most significant
+ * first: the same bits, in the same order, as n calls to buf_bit. */
+static void buf_bits(AzoBuf *b, uint32_t v, unsigned n)
+{
+    while (n) {
+        unsigned room, take, chunk;
+
+        if (b->oom)
+            return;
+        room = 8 - b->nbits;
+        take = n < room ? n : room;
+        chunk = (unsigned)(v >> (n - take)) & ((1u << take) - 1u);
+        b->cur |= chunk << (room - take);
+        b->nbits += take;
+        n -= take;
+        if (b->nbits == 8) {
+            if (b->len == b->cap) {
+                size_t ncap = b->cap ? b->cap * 2 : 4096;
+                uint8_t *np = realloc(b->p, ncap);
+
+                if (!np) {
+                    b->oom = 1;
+                    return;
+                }
+                b->p = np;
+                b->cap = ncap;
+            }
+            b->p[b->len++] = (uint8_t)b->cur;
+            b->cur = 0;
+            b->nbits = 0;
+        }
+    }
+}
+
+/* `count` copies of `bit`. */
+static void buf_run(AzoBuf *b, unsigned bit, unsigned count)
+{
+    uint32_t v = bit ? 0xFFFFFFFFu : 0u;
+
+    while (count >= 32) {
+        buf_bits(b, v, 32);
+        count -= 32;
+    }
+    if (count)
+        buf_bits(b, v, count);
+}
+#endif
+
 static void buf_align(AzoBuf *b)
 {
     while (b->nbits)
@@ -451,7 +515,61 @@ static void enc_init(AzoEnc *e)
     e->up = AZO_MASK;
 }
 
+#if AZO_WORDS
+/* alzgg: the two loops below, a whole run of bits at once. The first loop
+ * emits the k leading bits low and up share (k = clz(low ^ up)), the
+ * pending ones after the first of them; the second counts the m leading
+ * positions from bit 30 where low has 1 and up has 0 (underflow). Same bits
+ * out, same low / up / pending; the rare degenerate states (low == up, or a
+ * 31-bit underflow run) take the reference loops. */
+static void enc_renorm_ref(AzoEnc *e);
+
 static void enc_renorm(AzoEnc *e)
+{
+    uint32_t x = e->low ^ e->up;
+
+    if (!(x & AZO_MSB)) {
+        unsigned k, bit;
+
+        if (!x) {
+            enc_renorm_ref(e);
+            return;
+        }
+        k = (unsigned)__builtin_clz(x);
+        bit = e->low >> 31;
+        buf_bits(&e->out, bit, 1);
+        if (e->pending) {
+            buf_run(&e->out, bit ^ 1u, e->pending);
+            e->pending = 0;
+        }
+        if (k > 1)
+            buf_bits(&e->out, (e->low >> (32 - k)) & ((1u << (k - 1)) - 1u), k - 1);
+        e->low <<= k;
+        e->up = (e->up << k) | ((1u << k) - 1u);
+    }
+    {
+        uint32_t z = e->low & ~e->up;
+
+        if (z & AZO_SMSB) {
+            uint32_t t = ~z << 1;
+            unsigned m;
+
+            if (!t) {
+                enc_renorm_ref(e);
+                return;
+            }
+            m = (unsigned)__builtin_clz(t);
+            e->low = (e->low << m) & (AZO_MASK >> 1);
+            e->up = (e->up << m) | ((1u << m) - 1u) | AZO_MSB;
+            e->pending += m;
+        }
+    }
+}
+
+static void enc_renorm_ref(AzoEnc *e)
+#else
+static void enc_renorm(AzoEnc *e)
+#endif
 {
     while ((e->low & AZO_MSB) == (e->up & AZO_MSB)) {
         unsigned bit = (e->low & AZO_MSB) ? 1u : 0u;
@@ -849,6 +967,17 @@ static size_t finder_match_len(const uint8_t *d, size_t n, size_t cand,
     max = n - pos;
     if (max > AZO_MAXLEN)
         max = AZO_MAXLEN;
+#if AZO_WORDS
+    /* alzgg: 8 bytes at a time, same first mismatch (only bytes < max). */
+    while (L + 8 <= max) {
+        uint64_t a, b;
+        memcpy(&a, d + cand + L, 8);
+        memcpy(&b, d + pos + L, 8);
+        if (a != b)
+            return L + ((size_t)__builtin_ctzll(a ^ b) >> 3);
+        L += 8;
+    }
+#endif
     while (L < max && d[cand + L] == d[pos + L])
         L++;
     return L;
@@ -984,6 +1113,47 @@ static void ctx_match(AzoEncCtx *c, uint32_t dist, size_t len, int reuse)
 
 /* First remembered pair whose length is EXACTLY equal to the fresh match and
  * whose source agrees (ALZip's pair finder); -1 when none. */
+#if AZO_SSE2
+/* alzgg: same scan, same first index; the 128 lengths are compared to `len`
+ * sixteen at a time (SSE2) and only the equal slots are examined, in
+ * increasing order, with the reference's three tests. */
+static int ctx_best_pair(AzoEncCtx *c, size_t pos, size_t len)
+{
+    const uint32_t *lens = c->lenHist.rep;
+    const __m128i   key = _mm_set1_epi32((int)(uint32_t)len);
+    int             blk;
+
+    if (len > 0xFFFFFFFFu)
+        return -1;
+    for (blk = 0; blk < 128; blk += 16) {
+        unsigned m =
+            (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                _mm_loadu_si128((const __m128i *)(lens + blk)), key))) |
+            (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                _mm_loadu_si128((const __m128i *)(lens + blk + 4)), key))) << 4 |
+            (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                _mm_loadu_si128((const __m128i *)(lens + blk + 8)), key))) << 8 |
+            (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                _mm_loadu_si128((const __m128i *)(lens + blk + 12)), key))) << 12;
+
+        while (m) {
+            int      i = blk + __builtin_ctz(m);
+            uint32_t p = c->posHist.rep[i];
+
+            m &= m - 1;
+            if (p >= pos)
+                continue;
+            if (pos + len > c->n || p + len > c->n)
+                continue;
+            if (c->d[p] != c->d[pos] ||
+                memcmp(c->d + p, c->d + pos, len) != 0)
+                continue;
+            return i;
+        }
+    }
+    return -1;
+}
+#else
 static int ctx_best_pair(AzoEncCtx *c, size_t pos, size_t len)
 {
     int i;
@@ -1004,6 +1174,7 @@ static int ctx_best_pair(AzoEncCtx *c, size_t pos, size_t len)
     }
     return -1;
 }
+#endif
 
 /* One parser step (0x61905bf0): returns the number of bytes consumed. */
 static size_t ctx_step(AzoEncCtx *c, size_t pos)

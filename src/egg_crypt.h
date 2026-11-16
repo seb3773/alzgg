@@ -71,7 +71,7 @@ void egg_crypt_dec_close(EggCryptDec *d);
 int egg_pw_encode(const char *password, uint8_t *out, size_t cap,
                   size_t *out_len, char *err, size_t errsz);
 
-/* --------------------------------------------------------------- chiffrement */
+/* ---------------------------------------------------------------- encryption */
 
 /* Random material supplied by the caller for one member. ALZip draws it at
  * random: an archive is therefore reproducible byte for byte only if it is given

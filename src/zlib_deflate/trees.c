@@ -895,6 +895,73 @@ void ZLIB_INTERNAL _tr_align(deflate_state *s) {
 /* ===========================================================================
  * Send the block data compressed using the given Huffman trees
  */
+#if !defined(ZLIB_DEBUG) && !defined(ALZGG_NO_FAST_BITS) && defined(__GNUC__) && \
+    defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+/* alzgg: same symbols, same codes, same bit order, accumulated in a 64-bit
+ * register and stored 4 bytes at a time (LSB first, exactly like put_short).
+ * On exit the state is put back the way the 16-bit send_bits leaves it:
+ * every 16-bit word flushed except the last 1..16 bits (0 if none), so
+ * bi_buf / bi_valid / pending are identical to the reference code's. */
+local void compress_block(deflate_state *s, const ct_data *ltree,
+                          const ct_data *dtree) {
+    unsigned dist;      /* distance of matched string */
+    int lc;             /* match length or unmatched char (if dist == 0) */
+    unsigned sx = 0;    /* running index in symbol buffers */
+    unsigned code;      /* the code to send */
+    int extra;          /* number of extra bits to send */
+    unsigned long long acc = s->bi_buf;
+    unsigned n = (unsigned)s->bi_valid;
+    uchf *out = s->pending_buf + s->pending;
+
+#define ALZGG_PUT(v, l) { \
+    acc |= (unsigned long long)(v) << n; n += (unsigned)(l); \
+    if (n >= 32) { \
+        unsigned w_ = (unsigned)acc; zmemcpy(out, &w_, 4); out += 4; \
+        acc >>= 32; n -= 32; } }
+
+    if (s->sym_next != 0) do {
+#ifdef LIT_MEM
+        dist = s->d_buf[sx];
+        lc = s->l_buf[sx++];
+#else
+        dist = s->sym_buf[sx++] & 0xff;
+        dist += (unsigned)(s->sym_buf[sx++] & 0xff) << 8;
+        lc = s->sym_buf[sx++];
+#endif
+        if (dist == 0) {
+            ALZGG_PUT(ltree[lc].Code, ltree[lc].Len);
+        } else {
+            code = _length_code[lc];
+            ALZGG_PUT(ltree[code + LITERALS + 1].Code, ltree[code + LITERALS + 1].Len);
+            extra = extra_lbits[code];
+            if (extra != 0) {
+                lc -= base_length[code];
+                ALZGG_PUT(lc, extra);
+            }
+            dist--;
+            code = d_code(dist);
+            ALZGG_PUT(dtree[code].Code, dtree[code].Len);
+            extra = extra_dbits[code];
+            if (extra != 0) {
+                dist -= (unsigned)base_dist[code];
+                ALZGG_PUT(dist, extra);
+            }
+        }
+    } while (sx < s->sym_next);
+
+    ALZGG_PUT(ltree[END_BLOCK].Code, ltree[END_BLOCK].Len);
+#undef ALZGG_PUT
+    while (n > 16) {
+        *out++ = (uch)acc;
+        *out++ = (uch)(acc >> 8);
+        acc >>= 16;
+        n -= 16;
+    }
+    s->pending = (ulg)(out - s->pending_buf);
+    s->bi_buf = (ush)acc;
+    s->bi_valid = (int)n;
+}
+#else
 local void compress_block(deflate_state *s, const ct_data *ltree,
                           const ct_data *dtree) {
     unsigned dist;      /* distance of matched string */
@@ -947,6 +1014,7 @@ local void compress_block(deflate_state *s, const ct_data *ltree,
 
     send_code(s, END_BLOCK, ltree);
 }
+#endif
 
 /* ===========================================================================
  * Check if the data type is TEXT or BINARY, using the following algorithm:

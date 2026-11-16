@@ -20,10 +20,16 @@ typedef struct EggLea {
     int      rounds;
 } EggLea;
 
-/* `keylen` vaut 16 (LEA-128, 24 tours) ou 32 (LEA-256, 32 tours). */
+/* `keylen` is 16 (LEA-128, 24 rounds) or 32 (LEA-256, 32 rounds). */
 void egg_lea_init(EggLea *l, const uint8_t *key, size_t keylen);
 
 /* Encrypts one 16-byte block (input and output may be the same buffer). */
 void egg_lea_encrypt(const EggLea *l, const uint8_t in[16], uint8_t out[16]);
+
+/* alzgg: XORs `len` bytes of `buf` with the CTR keystream E(ctr), E(ctr+1),
+ * ... (128-bit big-endian counter, +1 per 16-byte block; a final partial
+ * block still consumes its counter), leaving `ctr` advanced. Same bytes as
+ * egg_lea_encrypt on each counter in turn. */
+void egg_lea_ctr_xor(const EggLea *l, uint8_t ctr[16], uint8_t *buf, size_t len);
 
 #endif

@@ -50,7 +50,7 @@ void egg_lea_init(EggLea *l, const uint8_t *key, size_t keylen)
 
     memset(l, 0, sizeof *l);
     if (keylen != 16 && keylen != 32) return;
-    n = keylen / 4;                       /* 4 ou 8 mots */
+    n = keylen / 4;                       /* 4 or 8 words */
     l->rounds = keylen == 16 ? 24 : 32;
     for (i = 0; i < n; ++i) t[i] = get_le32(key + 4 * i);
 
@@ -98,4 +98,90 @@ void egg_lea_encrypt(const EggLea *l, const uint8_t in[16], uint8_t out[16])
     }
     for (i = 0; i < 4; ++i) put_le32(out + 4 * i, x[i]);
     memset(x, 0, sizeof x);
+}
+
+/* ===================================================== CTR (alzgg) ======= */
+static void lea_ctr_inc(uint8_t ctr[16])
+{
+    int i;
+
+    for (i = 15; i >= 0; --i)
+        if (++ctr[i]) break;
+}
+
+#if defined(__SSE2__) && !defined(ALZGG_NO_LEA_SSE2)
+#include <emmintrin.h>
+
+#define LEA_ROL(v, n) _mm_or_si128(_mm_slli_epi32(v, n), _mm_srli_epi32(v, 32 - (n)))
+
+/* Four blocks per pass, one 32-bit lane per block (words transposed). */
+static void lea_encrypt4(const EggLea *l, const uint8_t in[64], uint8_t out[64])
+{
+    __m128i a = _mm_loadu_si128((const __m128i *)(in + 0));
+    __m128i b = _mm_loadu_si128((const __m128i *)(in + 16));
+    __m128i c = _mm_loadu_si128((const __m128i *)(in + 32));
+    __m128i d = _mm_loadu_si128((const __m128i *)(in + 48));
+    __m128i t0, t1, t2, t3, x0, x1, x2, x3;
+    int i;
+
+    /* transpose: xk = word k of blocks 0..3 (words are little-endian, as
+       get_le32 reads them on a little-endian x86) */
+    t0 = _mm_unpacklo_epi32(a, b); t1 = _mm_unpacklo_epi32(c, d);
+    t2 = _mm_unpackhi_epi32(a, b); t3 = _mm_unpackhi_epi32(c, d);
+    x0 = _mm_unpacklo_epi64(t0, t1); x1 = _mm_unpackhi_epi64(t0, t1);
+    x2 = _mm_unpacklo_epi64(t2, t3); x3 = _mm_unpackhi_epi64(t2, t3);
+
+    for (i = 0; i < l->rounds; ++i) {
+        const uint32_t *k = l->rk[i];
+        __m128i n0 = _mm_add_epi32(_mm_xor_si128(x0, _mm_set1_epi32((int)k[0])),
+                                   _mm_xor_si128(x1, _mm_set1_epi32((int)k[1])));
+        __m128i n1 = _mm_add_epi32(_mm_xor_si128(x1, _mm_set1_epi32((int)k[2])),
+                                   _mm_xor_si128(x2, _mm_set1_epi32((int)k[3])));
+        __m128i n2 = _mm_add_epi32(_mm_xor_si128(x2, _mm_set1_epi32((int)k[4])),
+                                   _mm_xor_si128(x3, _mm_set1_epi32((int)k[5])));
+        x3 = x0;
+        x0 = LEA_ROL(n0, 9);
+        x1 = LEA_ROL(n1, 27);          /* ror 5 */
+        x2 = LEA_ROL(n2, 29);          /* ror 3 */
+    }
+    t0 = _mm_unpacklo_epi32(x0, x1); t1 = _mm_unpacklo_epi32(x2, x3);
+    t2 = _mm_unpackhi_epi32(x0, x1); t3 = _mm_unpackhi_epi32(x2, x3);
+    _mm_storeu_si128((__m128i *)(out + 0),  _mm_unpacklo_epi64(t0, t1));
+    _mm_storeu_si128((__m128i *)(out + 16), _mm_unpackhi_epi64(t0, t1));
+    _mm_storeu_si128((__m128i *)(out + 32), _mm_unpacklo_epi64(t2, t3));
+    _mm_storeu_si128((__m128i *)(out + 48), _mm_unpackhi_epi64(t2, t3));
+}
+#define LEA_HAVE4 1
+#endif
+
+void egg_lea_ctr_xor(const EggLea *l, uint8_t ctr[16], uint8_t *buf, size_t len)
+{
+    uint8_t ks[64];
+    size_t i;
+
+#if defined(LEA_HAVE4) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (len >= 64) {
+        uint8_t in[64];
+        int b;
+
+        for (b = 0; b < 4; ++b) {
+            memcpy(in + 16 * b, ctr, 16);
+            lea_ctr_inc(ctr);
+        }
+        lea_encrypt4(l, in, ks);
+        for (i = 0; i < 64; ++i) buf[i] ^= ks[i];
+        buf += 64;
+        len -= 64;
+    }
+#endif
+    while (len) {
+        size_t n = len < 16 ? len : 16;
+
+        egg_lea_encrypt(l, ctr, ks);
+        for (i = 0; i < n; ++i) buf[i] ^= ks[i];
+        lea_ctr_inc(ctr);
+        buf += n;
+        len -= n;
+    }
+    memset(ks, 0, sizeof ks);
 }

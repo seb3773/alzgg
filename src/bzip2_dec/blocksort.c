@@ -342,6 +342,75 @@ void fallbackSort ( UInt32* fmap,
 /*---------------------------------------------*/
 
 /*---------------------------------------------*/
+#if defined(__GNUC__) && defined(__SSE2__) && !defined(ALZGG_NO_FAST_GTU) && \
+    defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+/* alzgg: the same comparison, eight positions at a time. It reads exactly
+   the bytes and quadrant entries the reference reads (12 bytes, then groups
+   of 8 within the BZ_N_OVERSHOOT copy), returns the same answer -- the first
+   position where block or quadrant differ decides, the block byte before the
+   quadrant entry at the same position -- and decrements *budget exactly as
+   often, which keeps the fallbackSort switch, hence the stream, unchanged. */
+#include <emmintrin.h>
+#include <string.h>
+static
+__inline__
+Bool mainGtU ( UInt32  i1, 
+               UInt32  i2,
+               UChar*  block, 
+               UInt16* quadrant,
+               UInt32  nblock,
+               Int32*  budget )
+{
+   Int32  k;
+
+   AssertD ( i1 != i2, "mainGtU" );
+   {
+      unsigned long long a, b;
+      unsigned int a4, b4;
+      memcpy(&a, block + i1, 8); memcpy(&b, block + i2, 8);
+      if (a != b) {
+         a = __builtin_bswap64(a); b = __builtin_bswap64(b);
+         return (a > b);
+      }
+      memcpy(&a4, block + i1 + 8, 4); memcpy(&b4, block + i2 + 8, 4);
+      if (a4 != b4) {
+         a4 = __builtin_bswap32(a4); b4 = __builtin_bswap32(b4);
+         return (a4 > b4);
+      }
+      i1 += 12; i2 += 12;
+   }
+
+   k = nblock + 8;
+
+   do {
+      unsigned long long a, b, x;
+      unsigned int kb, kq, mq;
+      __m128i q1, q2;
+      memcpy(&a, block + i1, 8); memcpy(&b, block + i2, 8);
+      q1 = _mm_loadu_si128((const __m128i*)(quadrant + i1));
+      q2 = _mm_loadu_si128((const __m128i*)(quadrant + i2));
+      x = a ^ b;
+      mq = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi16(q1, q2)) ^ 0xFFFFu;
+      if (x | mq) {
+         kb = x ? (unsigned int)__builtin_ctzll(x) >> 3 : 8u;
+         kq = mq ? (unsigned int)__builtin_ctz(mq) >> 1 : 8u;
+         if (kb <= kq)
+            return (block[i1 + kb] > block[i2 + kb]);
+         return (quadrant[i1 + kq] > quadrant[i2 + kq]);
+      }
+      i1 += 8; i2 += 8;
+
+      if (i1 >= nblock) i1 -= nblock;
+      if (i2 >= nblock) i2 -= nblock;
+
+      k -= 8;
+      (*budget)--;
+   }
+      while (k >= 0);
+
+   return False;
+}
+#else
 static
 __inline__
 Bool mainGtU ( UInt32  i1, 
@@ -467,6 +536,7 @@ Bool mainGtU ( UInt32  i1,
 
    return False;
 }
+#endif
 
 
 /*---------------------------------------------*/

@@ -481,7 +481,7 @@ static int subheader(const Parser *p, size_t pos, size_t *data, uint32_t *size)
 
     if (!need_at(p, pos, 5)) return -1;             /* sig(4) + flags(1) */
     flags = p->buf[pos + 4];
-    hdr = (flags & 0x01) ? 5 : 3;                   /* flags + taille(2|4) */
+    hdr = (flags & 0x01) ? 5 : 3;                   /* flags + size(2|4) */
     if (!need_at(p, pos, 4 + hdr)) return -1;
     *size = (flags & 0x01) ? le32(p->buf + pos + 5) : le16(p->buf + pos + 5);
     if (!need_at(p, pos, 4 + hdr + *size)) return -1;

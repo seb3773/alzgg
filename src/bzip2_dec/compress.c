@@ -27,6 +27,10 @@
 */
 
 #include "bzlib_private.h"
+#include <string.h>
+#if defined(__SSE2__) && defined(__GNUC__)
+#include <emmintrin.h>
+#endif
 
 
 /*---------------------------------------------------*/
@@ -119,7 +123,7 @@ void makeMaps_e ( EState* s )
 static
 void generateMTFValues ( EState* s )
 {
-   UChar   yy[256];
+   UChar   yy[256 + 16];   /* alzgg: +16 for the 16-byte search loads */
    Int32   i, j;
    Int32   zPend;
    Int32   wr;
@@ -158,6 +162,7 @@ void generateMTFValues ( EState* s )
 
    wr = 0;
    zPend = 0;
+   memset(yy, 0, sizeof yy);
    for (i = 0; i < s->nInUse; i++) yy[i] = (UChar) i;
 
    for (i = 0; i < s->nblock; i++) {
@@ -186,6 +191,36 @@ void generateMTFValues ( EState* s )
             };
             zPend = 0;
          }
+#if defined(__SSE2__) && defined(__GNUC__) && !defined(ALZGG_NO_FAST_MTF)
+         /* alzgg: same move-to-front, SSE2: the position j of ll_i in yy
+            (yy[0] != ll_i, so j >= 1; the first nInUse entries are a
+            permutation, so the first hit is the real one), then yy[0..j-1]
+            moves up one slot and ll_i goes to the front. */
+         {
+            const __m128i key = _mm_set1_epi8((char)ll_i);
+            unsigned int m;
+            j = 0;
+            for (;;) {
+               m = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+                      _mm_loadu_si128((const __m128i*)(yy + j)), key));
+               if (m) { j += __builtin_ctz(m); break; }
+               j += 16;
+            }
+            if (j < 16) {
+               static const char lane[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+               __m128i v   = _mm_loadu_si128((const __m128i*)yy);
+               __m128i sh  = _mm_slli_si128(v, 1);
+               __m128i keep = _mm_cmpgt_epi8(_mm_loadu_si128((const __m128i*)lane),
+                                             _mm_set1_epi8((char)j));
+               v = _mm_or_si128(_mm_and_si128(keep, v), _mm_andnot_si128(keep, sh));
+               _mm_storeu_si128((__m128i*)yy, v);
+            } else {
+               memmove(yy + 1, yy, (size_t)j);
+            }
+            yy[0] = ll_i;
+            mtfv[wr] = j+1; wr++; s->mtfFreq[j+1]++;
+         }
+#else
          {
             register UChar  rtmp;
             register UChar* ryy_j;
@@ -205,6 +240,7 @@ void generateMTFValues ( EState* s )
             j = ryy_j - &(yy[0]);
             mtfv[wr] = j+1; wr++; s->mtfFreq[j+1]++;
          }
+#endif
 
       }
    }

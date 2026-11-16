@@ -975,7 +975,7 @@ static int copy_stream(FILE *dst, FILE *src, char *err, size_t errsz)
     }
 }
 
-/* Recopie [off, off+len) de `path` vers l'archive (cas store). */
+/* Copies [off, off+len) from `path` to the archive (store case). */
 static int copy_range(FILE *dst, const char *path, uint64_t off, uint64_t len,
                       char *err, size_t errsz)
 {

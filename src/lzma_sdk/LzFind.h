@@ -44,6 +44,11 @@ typedef struct _CMatchFinder
   UInt32 numSons;
   SRes result;
   UInt32 crc[256];
+  /* alzgg: hash reuse across streams (see MatchFinder_Init). hashValid != 0
+     means every value stored in hash[] is <= pos, so a new stream started at
+     pos + cyclicBufferSize sees all of them as out of window -- exactly like
+     the kEmptyHashValue of a fresh table -- and the table needs no clearing. */
+  int hashValid;
 } CMatchFinder;
 
 #define Inline_MatchFinder_GetPointerToCurrentPos(p) ((p)->buffer)

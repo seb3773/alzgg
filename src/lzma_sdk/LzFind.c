@@ -1,10 +1,12 @@
 /* LzFind.c -- Match finder for LZ algorithms
 2008-10-04 : Igor Pavlov : Public domain */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "LzFind.h"
 #include "LzHash.h"
+#include "LzMatchLen.h"
 
 #define kEmptyHashValue 0
 #define kMaxValForNormalize ((UInt32)0xFFFFFFFF)
@@ -125,6 +127,7 @@ void MatchFinder_Construct(CMatchFinder *p)
   p->bufferBase = 0;
   p->directInput = 0;
   p->hash = 0;
+  p->hashValid = 0;
   MatchFinder_SetDefaultSettings(p);
 
   for (i = 0; i < 256; i++)
@@ -149,12 +152,17 @@ void MatchFinder_Free(CMatchFinder *p, ISzAlloc *alloc)
   LzInWindow_Free(p, alloc);
 }
 
+/* alzgg: the refs are taken zeroed (calloc: fresh pages, nothing touched),
+   which is what lets MatchFinder_Init skip clearing a 32 MiB hash for a
+   stream of a few bytes. The block is released through alloc->Free; the only
+   allocator handed to this SDK (src/egg_lzma.c) is malloc/free. */
 static CLzRef* AllocRefs(UInt32 num, ISzAlloc *alloc)
 {
   size_t sizeInBytes = (size_t)num * sizeof(CLzRef);
+  (void)alloc;
   if (sizeInBytes / sizeof(CLzRef) != num)
     return 0;
-  return (CLzRef *)alloc->Alloc(alloc, sizeInBytes);
+  return (CLzRef *)calloc(num, sizeof(CLzRef));
 }
 
 int MatchFinder_Create(CMatchFinder *p, UInt32 historySize,
@@ -221,10 +229,13 @@ int MatchFinder_Create(CMatchFinder *p, UInt32 historySize,
       if (p->hash != 0 && prevSize == newSize)
         return 1;
       MatchFinder_FreeThisClassMemory(p, alloc);
+      p->hashValid = 0;
       p->hash = AllocRefs(newSize, alloc);
       if (p->hash != 0)
       {
         p->son = p->hash + p->hashSizeSum;
+        p->pos = 0;          /* zeroed table: every value is <= pos */
+        p->hashValid = 1;
         return 1;
       }
     }
@@ -258,14 +269,31 @@ static void MatchFinder_SetLimits(CMatchFinder *p)
   p->posLimit = p->pos + limit;
 }
 
+/* alzgg: instead of clearing the hash table, a reused table (every value
+   <= p->pos, see hashValid) is kept and the new stream starts at
+   p->pos + cyclicBufferSize: every old value then yields delta >=
+   cyclicBufferSize, which the finders treat exactly like kEmptyHashValue
+   (both are rejected by the same `delta >= _cyclicBufferSize` /
+   `delta < p->cyclicBufferSize` tests). son[] is only ever read for positions
+   inside the window, all written by the current stream. Matches -- hence the
+   stream -- are identical to a cleared table; only the absolute positions
+   differ, and Normalize, which preserves every in-window delta, still keeps
+   them below 2^32. A table that would start too high is cleared as before. */
 void MatchFinder_Init(CMatchFinder *p)
 {
-  UInt32 i;
-  for (i = 0; i < p->hashSizeSum; i++)
-    p->hash[i] = kEmptyHashValue;
+  UInt32 start = p->cyclicBufferSize;
+  if (p->hashValid && p->pos <= (UInt32)0x7FFFFFFF - p->cyclicBufferSize)
+    start = p->pos + p->cyclicBufferSize;
+  else
+  {
+    UInt32 i;
+    for (i = 0; i < p->hashSizeSum; i++)
+      p->hash[i] = kEmptyHashValue;
+  }
+  p->hashValid = 1;
   p->cyclicBufferPos = 0;
   p->buffer = p->bufferBase;
-  p->pos = p->streamPos = p->cyclicBufferSize;
+  p->pos = p->streamPos = start;
   p->result = SZ_OK;
   p->streamEndWasReached = 0;
   MatchFinder_ReadBlock(p);
@@ -324,10 +352,7 @@ static UInt32 * Hc_GetMatchesSpec(UInt32 lenLimit, UInt32 curMatch, UInt32 pos, 
       curMatch = son[_cyclicBufferPos - delta + ((delta > _cyclicBufferPos) ? _cyclicBufferSize : 0)];
       if (pb[maxLen] == cur[maxLen] && *pb == *cur)
       {
-        UInt32 len = 0;
-        while (++len != lenLimit)
-          if (pb[len] != cur[len])
-            break;
+        UInt32 len = MatchLenFrom(pb, cur, 1, lenLimit);
         if (maxLen < len)
         {
           *distances++ = maxLen = len;
@@ -361,10 +386,7 @@ UInt32 * GetMatchesSpec1(UInt32 lenLimit, UInt32 curMatch, UInt32 pos, const Byt
       UInt32 len = (len0 < len1 ? len0 : len1);
       if (pb[len] == cur[len])
       {
-        if (++len != lenLimit && pb[len] == cur[len])
-          while (++len != lenLimit)
-            if (pb[len] != cur[len])
-              break;
+        len = MatchLenFrom(pb, cur, len + 1, lenLimit);
         if (maxLen < len)
         {
           *distances++ = maxLen = len;
@@ -415,9 +437,7 @@ static void SkipMatchesSpec(UInt32 lenLimit, UInt32 curMatch, UInt32 pos, const 
       UInt32 len = (len0 < len1 ? len0 : len1);
       if (pb[len] == cur[len])
       {
-        while (++len != lenLimit)
-          if (pb[len] != cur[len])
-            break;
+        len = MatchLenFrom(pb, cur, len + 1, lenLimit);
         {
           if (len == lenLimit)
           {
@@ -511,9 +531,7 @@ static UInt32 Bt3_MatchFinder_GetMatches(CMatchFinder *p, UInt32 *distances)
   offset = 0;
   if (delta2 < p->cyclicBufferSize && *(cur - delta2) == *cur)
   {
-    for (; maxLen != lenLimit; maxLen++)
-      if (cur[(ptrdiff_t)maxLen - delta2] != cur[maxLen])
-        break;
+    maxLen = MatchLenFrom(cur - delta2, cur, maxLen, lenLimit);
     distances[0] = maxLen;
     distances[1] = delta2 - 1;
     offset = 2;
@@ -558,9 +576,7 @@ static UInt32 Bt4_MatchFinder_GetMatches(CMatchFinder *p, UInt32 *distances)
   }
   if (offset != 0)
   {
-    for (; maxLen != lenLimit; maxLen++)
-      if (cur[(ptrdiff_t)maxLen - delta2] != cur[maxLen])
-        break;
+    maxLen = MatchLenFrom(cur - delta2, cur, maxLen, lenLimit);
     distances[offset - 2] = maxLen;
     if (maxLen == lenLimit)
     {
@@ -605,9 +621,7 @@ static UInt32 Hc4_MatchFinder_GetMatches(CMatchFinder *p, UInt32 *distances)
   }
   if (offset != 0)
   {
-    for (; maxLen != lenLimit; maxLen++)
-      if (cur[(ptrdiff_t)maxLen - delta2] != cur[maxLen])
-        break;
+    maxLen = MatchLenFrom(cur - delta2, cur, maxLen, lenLimit);
     distances[offset - 2] = maxLen;
     if (maxLen == lenLimit)
     {

@@ -184,6 +184,28 @@ local const config configuration_table[10] = {
      __attribute__((no_sanitize("memory")))
 #  endif
 #endif
+#if defined(__SSE2__) && !defined(ALZGG_NO_SSE2_SLIDE)
+#include <emmintrin.h>
+/* alzgg: m >= wsize ? m - wsize : NIL (NIL == 0) is exactly the unsigned
+ * saturating subtraction of SSE2; 8 entries per instruction. The table sizes
+ * (hash_size = 2^(memLevel+7), w_size = 2^windowBits) are multiples of 8. */
+local void slide_hash_sse2(Posf *p, unsigned n, uInt wsize) {
+    const __m128i w = _mm_set1_epi16((short)wsize);
+    for (; n >= 8; n -= 8, p += 8) {
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        _mm_storeu_si128((__m128i *)p, _mm_subs_epu16(v, w));
+    }
+    for (; n; n--, p++)
+        *p = (Pos)(*p >= wsize ? *p - wsize : NIL);
+}
+
+local void slide_hash(deflate_state *s) {
+    slide_hash_sse2(s->head, s->hash_size, s->w_size);
+#ifndef FASTEST
+    slide_hash_sse2(s->prev, s->w_size, s->w_size);
+#endif
+}
+#else
 local void slide_hash(deflate_state *s) {
     unsigned n, m;
     Posf *p;
@@ -207,6 +229,7 @@ local void slide_hash(deflate_state *s) {
     } while (--n);
 #endif
 }
+#endif
 
 /* ===========================================================================
  * Read a new buffer from the current input stream, update the adler32
@@ -1335,6 +1358,12 @@ int ZEXPORT deflateCopy(z_streamp dest, z_streamp source) {
 #endif /* MAXSEG_64K */
 }
 
+#if !defined(ALZGG_NO_WORD_MATCH) && defined(__GNUC__) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)) && \
+    defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#  define ALZGG_WORD_MATCH
+#endif
+
 #ifndef FASTEST
 /* ===========================================================================
  * Set match_start to the longest match starting at the given string and
@@ -1367,6 +1396,10 @@ local uInt longest_match(deflate_state *s, IPos cur_match) {
     register Bytef *strend = s->window + s->strstart + MAX_MATCH - 1;
     register ush scan_start = *(ushf*)scan;
     register ush scan_end   = *(ushf*)(scan + best_len - 1);
+#elif defined(ALZGG_WORD_MATCH)
+    unsigned short scan_start16, scan_end16;
+    zmemcpy(&scan_start16, scan, 2);
+    zmemcpy(&scan_end16, scan + best_len - 1, 2);
 #else
     register Bytef *strend = s->window + s->strstart + MAX_MATCH;
     register Byte scan_end1  = scan[best_len - 1];
@@ -1402,7 +1435,40 @@ local uInt longest_match(deflate_state *s, IPos cur_match) {
          * However the length of the match is limited to the lookahead, so
          * the output of deflate is not affected by the uninitialized values.
          */
-#if (defined(UNALIGNED_OK) && MAX_MATCH == 258)
+#if defined(ALZGG_WORD_MATCH) && !defined(UNALIGNED_OK)
+        /* alzgg: same rejection test as the byte version below, then the
+         * length is the first mismatch in [3, MAX_MATCH) -- byte 2 is not
+         * compared, as below -- or MAX_MATCH, found 8 bytes at a time. The
+         * byte loop below yields exactly that value too (its last compare,
+         * at strstart + 258, cannot change len). Only bytes below
+         * strstart + 258 are read. */
+        {
+            /* two bytes per test: equal pairs iff both bytes are equal */
+            unsigned short m_end, m_start;
+            zmemcpy(&m_end, match + best_len - 1, 2);
+            zmemcpy(&m_start, match, 2);
+            if (m_end != scan_end16 || m_start != scan_start16) continue;
+        }
+        {
+            unsigned j = 3;
+            while (j + 8 <= MAX_MATCH) {
+                unsigned long long a, b;
+                zmemcpy(&a, scan + j, 8);
+                zmemcpy(&b, match + j, 8);
+                a ^= b;
+                if (a) {
+                    j += (unsigned)__builtin_ctzll(a) >> 3;
+                    goto alzgg_len_found;
+                }
+                j += 8;
+            }
+            while (j < MAX_MATCH && scan[j] == match[j])
+                j++;
+        alzgg_len_found:
+            len = (int)j;
+        }
+
+#elif (defined(UNALIGNED_OK) && MAX_MATCH == 258)
         /* This code assumes sizeof(unsigned short) == 2. Do not use
          * UNALIGNED_OK if your compiler uses a different size.
          */
@@ -1476,6 +1542,8 @@ local uInt longest_match(deflate_state *s, IPos cur_match) {
             if (len >= nice_match) break;
 #ifdef UNALIGNED_OK
             scan_end = *(ushf*)(scan + best_len - 1);
+#elif defined(ALZGG_WORD_MATCH)
+            zmemcpy(&scan_end16, scan + best_len - 1, 2);
 #else
             scan_end1  = scan[best_len - 1];
             scan_end   = scan[best_len];

@@ -13,6 +13,7 @@
 #include "LzmaEnc.h"
 
 #include "LzFind.h"
+#include "LzMatchLen.h"
 #ifdef COMPRESS_MF_MT
 #include "LzFindMt.h"
 #endif
@@ -860,7 +861,7 @@ static UInt32 ReadMatchDistances(CLzmaEnc *p, UInt32 *numDistancePairsRes)
         numAvail = LZMA_MATCH_LEN_MAX;
       {
         const Byte *pby2 = pby - distance;
-        for (; lenRes < numAvail && pby[lenRes] == pby2[lenRes]; lenRes++);
+        lenRes = MatchLenFrom(pby, pby2, lenRes, numAvail);
       }
     }
   }
@@ -995,7 +996,7 @@ static UInt32 GetOptimum(CLzmaEnc *p, UInt32 position, UInt32 *backRes)
       repLens[i] = 0;
       continue;
     }
-    for (lenTest = 2; lenTest < numAvail && data[lenTest] == data2[lenTest]; lenTest++);
+    lenTest = MatchLenFrom(data, data2, 2, numAvail);
     repLens[i] = lenTest;
     if (lenTest > repLens[repMaxIndex])
       repMaxIndex = i;
@@ -1295,7 +1296,7 @@ static UInt32 GetOptimum(CLzmaEnc *p, UInt32 position, UInt32 *backRes)
       if (limit > numAvailFull)
         limit = numAvailFull;
 
-      for (temp = 1; temp < limit && data[temp] == data2[temp]; temp++);
+      temp = MatchLenFrom(data, data2, 1, limit);
       lenTest2 = temp - 1;
       if (lenTest2 >= 2)
       {
@@ -1336,7 +1337,7 @@ static UInt32 GetOptimum(CLzmaEnc *p, UInt32 position, UInt32 *backRes)
       const Byte *data2 = data - (reps[repIndex] + 1);
       if (data[0] != data2[0] || data[1] != data2[1])
         continue;
-      for (lenTest = 2; lenTest < numAvail && data[lenTest] == data2[lenTest]; lenTest++);
+      lenTest = MatchLenFrom(data, data2, 2, numAvail);
       while (lenEnd < cur + lenTest)
         p->opt[++lenEnd].price = kInfinityPrice;
       lenTestTemp = lenTest;
@@ -1366,7 +1367,7 @@ static UInt32 GetOptimum(CLzmaEnc *p, UInt32 position, UInt32 *backRes)
           UInt32 nextRepMatchPrice;
           if (limit > numAvailFull)
             limit = numAvailFull;
-          for (; lenTest2 < limit && data[lenTest2] == data2[lenTest2]; lenTest2++);
+          lenTest2 = MatchLenFrom(data, data2, lenTest2, limit);
           lenTest2 -= lenTest + 1;
           if (lenTest2 >= 2)
           {
@@ -1456,7 +1457,7 @@ static UInt32 GetOptimum(CLzmaEnc *p, UInt32 position, UInt32 *backRes)
           UInt32 nextRepMatchPrice;
           if (limit > numAvailFull)
             limit = numAvailFull;
-          for (; lenTest2 < limit && data[lenTest2] == data2[lenTest2]; lenTest2++);
+          lenTest2 = MatchLenFrom(data, data2, lenTest2, limit);
           lenTest2 -= lenTest + 1;
           if (lenTest2 >= 2)
           {
@@ -1536,7 +1537,7 @@ static UInt32 GetOptimumFast(CLzmaEnc *p, UInt32 *backRes)
     const Byte *data2 = data - (p->reps[i] + 1);
     if (data[0] != data2[0] || data[1] != data2[1])
       continue;
-    for (len = 2; len < numAvail && data[len] == data2[len]; len++);
+    len = MatchLenFrom(data, data2, 2, numAvail);
     if (len >= p->numFastBytes)
     {
       *backRes = i;
@@ -1606,7 +1607,7 @@ static UInt32 GetOptimumFast(CLzmaEnc *p, UInt32 *backRes)
     if (data[0] != data2[0] || data[1] != data2[1])
       continue;
     limit = mainLen - 1;
-    for (len = 2; len < limit && data[len] == data2[len]; len++);
+    len = MatchLenFrom(data, data2, 2, limit);
     if (len >= limit)
       return 1;
   }
